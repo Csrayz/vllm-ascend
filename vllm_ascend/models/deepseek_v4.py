@@ -472,11 +472,15 @@ class DeepseekV4MoE(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
-            fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+            fused_moe_out = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states, input_ids=input_ids
+            )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits = F.linear(hidden_states.float(), self.gate.weight)
-            fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+            fused_moe_out = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids
+            )
 
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
@@ -987,6 +991,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -997,7 +1002,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, input_ids=input_ids)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -1134,7 +1139,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
         aux_hidden_states: list[torch.Tensor] = []
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling, input_ids)
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states.mean(dim=1))
 
@@ -1145,12 +1150,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # MTP layers receive the full token set — otherwise only rank 0's
         # partition is valid and the rest of the buffer holds stale data,
         # leading to NaN values and low acceptance rate.
-        from vllm_ascend.ascend_forward_context import get_forward_context
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
-        forward_ctx = get_forward_context()
-        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+        if _EXTRA_CTX.flash_comm_v1_enabled:
             h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
-            pad_size = forward_ctx.pad_size
+            pad_size = _EXTRA_CTX.pad_size
             if pad_size > 0:
                 h_states_flat = h_states_flat[:-pad_size]
             num_tokens = h_states_flat.shape[0]

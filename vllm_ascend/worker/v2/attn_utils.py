@@ -52,6 +52,10 @@ _ATTENTION_MASK_BUILDER = None
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
+    # Lazy import to avoid the model-inspection circular import chain
+    # (layer -> dsa_v1 -> worker.npu_input_batch) hit during v2 init.
+    from vllm_ascend.models.layer.attention.layer import DSAAttention
+
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = AttentionLayerBase
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
@@ -81,6 +85,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
             )
+            continue
+        if isinstance(attn_module, DSAAttention):
+            spec = attn_module.get_kv_cache_spec(vllm_config)
+            if spec is not None:
+                kv_cache_spec[layer_name] = spec
+            continue
 
     return kv_cache_spec
 
