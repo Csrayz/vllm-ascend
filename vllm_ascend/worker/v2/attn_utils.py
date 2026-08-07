@@ -28,9 +28,7 @@ from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vll
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -56,7 +54,6 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
     get_ascend_device_type,
-    is_hidden_state_cache_spec,
 )
 
 _ATTENTION_MASK_BUILDER = None
@@ -64,10 +61,6 @@ _ATTENTION_MASK_BUILDER = None
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
-    # Lazy import to avoid the model-inspection circular import chain
-    # (layer -> dsa_v1 -> worker.npu_input_batch) hit during v2 init.
-    from vllm_ascend.models.layer.attention.layer import DSAAttention
-
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = AttentionLayerBase
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
@@ -98,18 +91,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 cache_dtype_str=cache_dtype_str,
             )
             continue
-        if isinstance(attn_module, DSAAttention):
-            spec = attn_module.get_kv_cache_spec(vllm_config)
-            if spec is not None:
-                kv_cache_spec[layer_name] = spec
-            continue
 
-        # Generic fallback for other AttentionLayerBase subclasses. DeepSeek V4
-        # DSA is a hybrid model: each decoder layer also registers
-        # DeepseekV4SWACache / DeepseekV4IndexerCache / CompressorStateCache
-        # sublayers, and pure-SWA layers (compress_ratio <= 1) only have those.
-        # Skipping them leaves the DSA layer with no attention metadata at
-        # forward time. Ported from v1 NPUModelRunner.get_kv_cache_spec.
+        # Generic fallback for other AttentionLayerBase subclasses.
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             kv_cache_spec[layer_name] = spec
 
@@ -330,16 +313,10 @@ def _get_attention_kv_cache_dims(layer_name: str, kv_cache_spec: AttentionSpec) 
     if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
         attn_layers = get_layers_from_vllm_config(get_current_vllm_config(), AttentionLayerBase, [layer_name])
         attn_layer = attn_layers[layer_name]
-        if isinstance(attn_layer, MLAAttention):
-            # DeepSeek MLA: K=kv_lora_rank, V=qk_rope_head_dim
-            return attn_layer.kv_lora_rank, attn_layer.qk_rope_head_dim
-        # CacheOnlyAttentionLayer uses AscendMLAAttentionSpec but isn't MLAAttention
-        if isinstance(attn_layer, CacheOnlyAttentionLayer):
-            return kv_cache_spec.head_size, kv_cache_spec.head_size
-        raise TypeError(
-            f"Expected MLAAttention or CacheOnlyAttentionLayer for {layer_name}, "
-            f"got {type(attn_layer).__name__}."
-        )
+        if not isinstance(attn_layer, MLAAttention):
+            raise TypeError(f"Expected MLAAttention layer for {layer_name}, got {type(attn_layer).__name__}.")
+        # DeepSeek MLA: K=kv_lora_rank, V=qk_rope_head_dim
+        return attn_layer.kv_lora_rank, attn_layer.qk_rope_head_dim
 
     head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
     return kv_cache_spec.head_size, head_size_v
@@ -421,14 +398,12 @@ def _allocate_kv_cache(
     the models. NOTE: To support prefill disaggregation, the addr of each cache
     tensor is aligned by 2 MiB when ``kv_transfer_config`` is enabled.
 
-    Three allocation paths are supported (matching v1
+    Two allocation paths are supported (matching v1
     ``NPUModelRunner._allocate_kv_cache_tensors``):
 
-    1. Single-tensor path for ``linear_attn`` / ``cache_only_layers`` /
-       ``is_hidden_state_cache_spec`` layers (no K/V split).
-    2. Single-tensor path for ``use_compress`` attention layers (DSA
+    1. Single-tensor path for ``use_compress`` attention layers (DSA
        ``compress_kv_cache``: K=V share one tensor).
-    3. Regular attention: ``(k_tensor, v_tensor)`` tuple, split according to
+    2. Regular attention: ``(k_tensor, v_tensor)`` tuple, split according to
        MLA/FA-quant dims.
 
     Args:
@@ -457,14 +432,9 @@ def _allocate_kv_cache(
         example_layer_name = kv_cache_tensor.shared_by[0]
         example_kv_cache_spec = layer_kv_cache_spec[example_layer_name]
 
-        # Path 1 & 2: single-tensor allocation (linear_attn / cache_only /
-        # hidden_state / use_compress attn). K and V share the same tensor.
-        is_single_tensor_attn = (
-            "linear_attn" in example_layer_name
-            or "cache_only_layers" in example_layer_name
-            or is_hidden_state_cache_spec(example_kv_cache_spec)
-            or ("attn" in example_layer_name and use_compress)
-        )
+        # Path 1: single-tensor allocation (use_compress attn). K=V share one
+        # tensor for the DSA compress_kv_cache.
+        is_single_tensor_attn = "attn" in example_layer_name and use_compress
         if is_single_tensor_attn:
             tensor = _allocate_int8_cache_tensor(
                 kv_cache_tensor.size,
@@ -476,7 +446,7 @@ def _allocate_kv_cache(
                 kv_cache_raw_tensors[layer_name] = tensor
             continue
 
-        # Path 3: regular attention — (k_tensor, v_tensor) tuple.
+        # Path 2: regular attention — (k_tensor, v_tensor) tuple.
         # NOTE: We need to init k_cache tensor (nope cache tensor in mla) and
         # v_cache tensor (rope cache tensor in mla) separately to support
         # prefill disaggregation, as it only supports the 0-dim of kv_cache is
@@ -522,106 +492,6 @@ def _allocate_kv_cache(
     return kv_cache_raw_tensors
 
 
-def _reshape_kv_cache(
-    kv_cache_config: KVCacheConfig,
-    kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]],
-    attn_backends: dict[str, AttentionBackend],
-    cache_dtype: str,
-    kernel_block_sizes: list[int] | None = None,
-    shared_kv_cache_layers: dict[str, str] | None = None,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    """
-    Reshape the KV cache tensors to the desired shape and dtype.
-
-    Args:
-        kv_cache_config: The KV cache config
-        kv_cache_raw_tensors: The KV cache buffer of each layer, with correct
-            size but uninitialized shape
-    Returns:
-        dict[str, tuple[torch.Tensor, torch.Tensor]]: A map between layer names
-            to their corresponding memory buffer for KV cache
-    """
-    vllm_config = get_current_vllm_config()
-
-    kv_caches: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-    kernel_block_sizes = kernel_block_sizes or []
-    for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
-        for layer_name in kv_cache_group_spec.layer_names:
-            if shared_kv_cache_layers and layer_name in shared_kv_cache_layers:
-                continue
-            kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
-            assert isinstance(kv_cache_spec, AttentionSpec)
-
-            if isinstance(kv_cache_spec, AttentionSpec):
-                raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_k_tensor is not None
-                assert raw_v_tensor is not None
-                sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
-                assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
-                num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
-
-                # `num_blocks` is the number of blocks the model runner can use.
-                # `kv_cache_config.num_blocks` is the number of blocks that
-                # KVCacheManager may allocate.
-                # Since different GPUs may have different number of layers and
-                # different memory capacities, `num_blocks` can be different on
-                # different GPUs, and `kv_cache_config.num_blocks` is set to
-                # the min of all `num_blocks`. Verify it here.
-                assert num_blocks >= kv_cache_config.num_blocks
-
-                attn_backend = attn_backends[layer_name]
-                if kv_cache_group_id < len(kernel_block_sizes):
-                    kernel_block_size = kernel_block_sizes[kv_cache_group_id]
-                    num_blocks *= kv_cache_spec.block_size // kernel_block_size
-                else:
-                    kernel_block_size = kv_cache_spec.block_size
-
-                if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                    shape_block_size = kv_cache_spec.storage_block_size
-                else:
-                    shape_block_size = kernel_block_size
-
-                kv_cache_shape = attn_backend.get_kv_cache_shape(
-                    num_blocks,
-                    shape_block_size,
-                    kv_cache_spec.num_kv_heads,
-                    kv_cache_spec.head_size,
-                    cache_dtype,
-                )
-                if not isinstance(kv_cache_spec, AscendMLAAttentionSpec):
-                    k_shape = kv_cache_shape[1:]
-                    if hasattr(kv_cache_spec, "head_size_v"):
-                        v_shape = (*kv_cache_shape[1:-1], kv_cache_spec.head_size_v)
-                    else:
-                        v_shape = k_shape
-                else:
-                    # k_cache: nope_cache    v_cache: rope_cache
-                    mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
-                    k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
-                    k_shape = (mla_num_blocks, mla_block_size, num_kv_heads, k_dim)
-                    v_shape = (mla_num_blocks, mla_block_size, num_kv_heads, v_dim)
-
-                k_cache_dtype = v_cache_dtype = kv_cache_spec.dtype
-                if enable_fa_quant(vllm_config):
-                    k_cache_dtype, v_cache_dtype = vllm_config.quant_config.get_kv_quant_dtype(
-                        layer_name, kv_cache_spec.dtype, vllm_config.model_config
-                    )
-
-                k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
-                v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
-                kv_caches[layer_name] = (k_cache, v_cache)
-            else:
-                raise ValueError("Unknown KV cache spec type.")
-
-    if shared_kv_cache_layers:
-        for layer_name, target_layer_name in shared_kv_cache_layers.items():
-            kv_caches[layer_name] = kv_caches[target_layer_name]
-
-    return kv_caches
-
-
 def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
@@ -633,8 +503,7 @@ def _reshape_kv_cache_v2(
     """Reshape the KV cache tensors to the desired shape and dtype.
 
     Matches v1 ``NPUModelRunner._reshape_kv_cache_tensors``. Single-tensor
-    paths (use_compress / cache_only_layers / hidden_state) are handled
-    before the regular (k, v) tuple path.
+    paths (use_compress) are handled before the regular (k, v) tuple path.
     """
     vllm_config = get_current_vllm_config()
     hf_config = getattr(vllm_config.model_config, "hf_config", None)
@@ -730,48 +599,7 @@ def _reshape_kv_cache_v2(
                 kv_caches[layer_name] = kv_cache
                 continue
 
-            # Path B: cache_only_layers / hidden_state single-tensor reshape
-            # (extract_hidden_states). No K/V split.
-            if (
-                "cache_only_layers" in layer_name
-                or is_hidden_state_cache_spec(kv_cache_spec)
-            ):
-                raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert isinstance(raw_tensor, torch.Tensor)
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-                if kv_cache_config is not None:
-                    assert num_blocks >= kv_cache_config.num_blocks
-                kv_cache_shape = group.backend.get_kv_cache_shape(
-                    num_blocks,
-                    kv_cache_spec.block_size,
-                    kv_cache_spec.num_kv_heads,
-                    kv_cache_spec.head_size,
-                )
-                raw_tensor = raw_tensor.view(kv_cache_spec.dtype)
-                page_size_padded = getattr(
-                    kv_cache_spec, "page_size_padded", None
-                )
-                if page_size_padded is not None:
-                    dtype_size = get_dtype_size(kv_cache_spec.dtype)
-                    page_stride = page_size_padded // dtype_size
-                    strides = [1] * len(kv_cache_shape)
-                    for dim_idx in range(len(kv_cache_shape) - 2, -1, -1):
-                        strides[dim_idx] = (
-                            strides[dim_idx + 1] * kv_cache_shape[dim_idx + 1]
-                        )
-                    strides[0] = page_stride
-                    k_cache = torch.as_strided(
-                        raw_tensor,
-                        size=kv_cache_shape,
-                        stride=tuple(strides),
-                    )
-                else:
-                    k_cache = raw_tensor.view(kv_cache_shape)
-                kv_caches[layer_name] = k_cache
-                continue
-
-            # Path D: regular AttentionSpec — (k_cache, v_cache) tuple.
+            # Path B: regular AttentionSpec — (k_cache, v_cache) tuple.
             assert isinstance(kv_cache_spec, AttentionSpec)
 
             raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[layer_name]
