@@ -44,10 +44,11 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
-    AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
 )
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -103,6 +104,15 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 kv_cache_spec[layer_name] = spec
             continue
 
+        # Generic fallback for other AttentionLayerBase subclasses. DeepSeek V4
+        # DSA is a hybrid model: each decoder layer also registers
+        # DeepseekV4SWACache / DeepseekV4IndexerCache / CompressorStateCache
+        # sublayers, and pure-SWA layers (compress_ratio <= 1) only have those.
+        # Skipping them leaves the DSA layer with no attention metadata at
+        # forward time. Ported from v1 NPUModelRunner.get_kv_cache_spec.
+        if spec := attn_module.get_kv_cache_spec(vllm_config):
+            kv_cache_spec[layer_name] = spec
+
     return kv_cache_spec
 
 
@@ -154,6 +164,15 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
+
+    # DSA (DeepSeek V4) builders share three mutable dicts across attention
+    # groups so that cos/sin, decode/prefill split, and per-layer SAS indexer
+    # metadata are computed once by the first DSA group and reused by
+    # subsequent groups (including DSA-CP). Ported from v1
+    # NPUModelRunner._build_attn_group_metadata.
+    prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
+    decode_ratio_to_sas_metadata: dict[Any, Any] = {}
+    common_ratio_to_sas_metadata: dict[Any, Any] = {}
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -187,22 +206,68 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
-            else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
-                    )
-                    if model_specific_attn_metadata is not None
-                    else {}
+
+            # Detect DSA / DSA-CP builders that require special kwargs or
+            # must bypass build_for_cudagraph_capture.
+            is_dsa_builder = isinstance(
+                attn_metadata_builder,
+                (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder),
+            )
+
+            attn_metadata_extra_kwargs = (
+                model_specific_attn_metadata.get_extra_attn_kwargs(
+                    attn_metadata_builder,
+                    num_reqs,
                 )
+                if model_specific_attn_metadata is not None
+                else {}
+            )
+
+            # DSA builders require prefill/decode/common_ratio_to_sas_metadata
+            # dicts plus num_reqs_actual and block_size. For cudagraph capture,
+            # pass empty dicts so the builder recomputes during graph replay.
+            if is_dsa_builder:
+                if for_cudagraph_capture:
+                    prefill_ratio_to_sas_metadata = {}
+                    decode_ratio_to_sas_metadata = {}
+                    common_ratio_to_sas_metadata = {}
+                attn_metadata_extra_kwargs.update(
+                    num_reqs_actual=num_reqs,
+                    prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
+                    decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
+                    common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                    block_size=attn_group.kv_cache_spec.block_size,
+                )
+
+            # DSA / DSA-CP builders must use build() instead of
+            # build_for_cudagraph_capture() during graph capture, because the
+            # base build_for_cudagraph_capture does not forward the extra kwargs
+            # that these builders require.
+            if for_cudagraph_capture and not is_dsa_builder:
+                metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                    common_attn_metadata
+                )
+            else:
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+
+            # Read back the populated dicts from the DSA (non-CP) builder so
+            # subsequent DSA groups can reuse the precomputed cos/sin and
+            # per-layer SAS indexer metadata.
+            if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
+                prefill_ratio_to_sas_metadata = (
+                    attn_metadata_builder.prefill_ratio_to_sas_metadata
+                )
+                decode_ratio_to_sas_metadata = (
+                    attn_metadata_builder.decode_ratio_to_sas_metadata
+                )
+                common_ratio_to_sas_metadata = (
+                    attn_metadata_builder.common_ratio_to_sas_metadata
+                )
+
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
@@ -287,10 +352,6 @@ def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return tensor[int(offset):]
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def _allocate_int8_cache_tensor(
     numel: int,
     alignment: int,
@@ -311,47 +372,6 @@ def _allocate_int8_cache_tensor(
 
     raw_tensor = torch.zeros(numel + alignment, dtype=torch.int8, device=device)
     return _align_memory(raw_tensor, alignment)[:numel]
-
-
-def _allocate_sparse_c8_indexer_tensors(
-    dsa_k_tensor_size: int,
-    dsa_k_scale_tensor_size: int,
-    alignment: int,
-    scale_dtype: torch.dtype,
-    device: torch.device,
-    kv_transfer_config,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate dsa_k and dsa_k_scale from one aligned int8 raw allocation.
-
-    Both returned tensors are logical views into the same underlying storage,
-    which reduces HCCL/Mooncake registration count. Ported from v1
-    ``NPUModelRunner._allocate_sparse_c8_indexer_tensors``.
-    """
-    if dsa_k_tensor_size <= 0:
-        raise ValueError(f"Invalid dsa_k_tensor_size: {dsa_k_tensor_size}")
-    if dsa_k_scale_tensor_size <= 0:
-        raise ValueError(f"Invalid dsa_k_scale_tensor_size: {dsa_k_scale_tensor_size}")
-
-    scale_dtype_size = torch.empty((), dtype=scale_dtype).element_size()
-    # Ensure the scale view starts at an address aligned for scale_dtype.
-    scale_offset = _align_up(dsa_k_tensor_size, scale_dtype_size)
-    total_raw_size = scale_offset + dsa_k_scale_tensor_size
-
-    sparse_c8_raw_tensor = _allocate_int8_cache_tensor(
-        total_raw_size, alignment, device, kv_transfer_config
-    )
-
-    dsa_k_tensor = sparse_c8_raw_tensor[:dsa_k_tensor_size]
-    dsa_k_scale_tensor = sparse_c8_raw_tensor[
-        scale_offset : scale_offset + dsa_k_scale_tensor_size
-    ]
-
-    assert dsa_k_tensor.is_contiguous()
-    assert dsa_k_scale_tensor.is_contiguous()
-    assert dsa_k_scale_tensor.data_ptr() % scale_dtype_size == 0
-    assert dsa_k_scale_tensor.numel() % scale_dtype_size == 0
-
-    return dsa_k_tensor, dsa_k_scale_tensor
 
 
 def _adjust_kv_layout(
@@ -408,9 +428,7 @@ def _allocate_kv_cache(
        ``is_hidden_state_cache_spec`` layers (no K/V split).
     2. Single-tensor path for ``use_compress`` attention layers (DSA
        ``compress_kv_cache``: K=V share one tensor).
-    3. ``AscendSFAIndexerCacheSpec`` path: ``(k_tensor,)`` or
-       ``(k_tensor, scale_tensor)`` depending on ``scale_dim``.
-    4. Regular attention: ``(k_tensor, v_tensor)`` tuple, split according to
+    3. Regular attention: ``(k_tensor, v_tensor)`` tuple, split according to
        MLA/FA-quant dims.
 
     Args:
@@ -439,49 +457,6 @@ def _allocate_kv_cache(
         example_layer_name = kv_cache_tensor.shared_by[0]
         example_kv_cache_spec = layer_kv_cache_spec[example_layer_name]
 
-        # Path 3: AscendSFAIndexerCacheSpec — indexer k cache (+ optional scale)
-        if isinstance(example_kv_cache_spec, AscendSFAIndexerCacheSpec):
-            current_spec = example_kv_cache_spec
-            num_blocks = kv_cache_tensor.size // current_spec.page_size_bytes
-            k_tensor_size = (
-                num_blocks
-                * current_spec.sfa_dcp_replicated_indexer_size
-                * current_spec.block_size
-                * current_spec.num_kv_heads
-                * current_spec.head_size
-                * get_dtype_size(current_spec.dtype)
-            )
-            if current_spec.scale_dim:
-                scale_tensor_size = (
-                    num_blocks
-                    * current_spec.sfa_dcp_replicated_indexer_size
-                    * current_spec.block_size
-                    * current_spec.num_kv_heads
-                    * current_spec.scale_dim
-                    * get_dtype_size(current_spec.scale_dtype)
-                )
-                k_tensor, scale_tensor = _allocate_sparse_c8_indexer_tensors(
-                    dsa_k_tensor_size=k_tensor_size,
-                    dsa_k_scale_tensor_size=scale_tensor_size,
-                    alignment=alignment,
-                    scale_dtype=current_spec.scale_dtype,
-                    device=device,
-                    kv_transfer_config=vllm_config.kv_transfer_config,
-                )
-                raw_cache: tuple[torch.Tensor, ...] = (k_tensor, scale_tensor)
-            else:
-                k_tensor = _allocate_int8_cache_tensor(
-                    k_tensor_size,
-                    alignment,
-                    device,
-                    vllm_config.kv_transfer_config,
-                )
-                raw_cache = (k_tensor,)
-
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = raw_cache
-            continue
-
         # Path 1 & 2: single-tensor allocation (linear_attn / cache_only /
         # hidden_state / use_compress attn). K and V share the same tensor.
         is_single_tensor_attn = (
@@ -501,7 +476,7 @@ def _allocate_kv_cache(
                 kv_cache_raw_tensors[layer_name] = tensor
             continue
 
-        # Path 4: regular attention — (k_tensor, v_tensor) tuple.
+        # Path 3: regular attention — (k_tensor, v_tensor) tuple.
         # NOTE: We need to init k_cache tensor (nope cache tensor in mla) and
         # v_cache tensor (rope cache tensor in mla) separately to support
         # prefill disaggregation, as it only supports the 0-dim of kv_cache is
@@ -658,8 +633,8 @@ def _reshape_kv_cache_v2(
     """Reshape the KV cache tensors to the desired shape and dtype.
 
     Matches v1 ``NPUModelRunner._reshape_kv_cache_tensors``. Single-tensor
-    paths (use_compress / AscendSFAIndexerCacheSpec / cache_only_layers /
-    hidden_state) are handled before the regular (k, v) tuple path.
+    paths (use_compress / cache_only_layers / hidden_state) are handled
+    before the regular (k, v) tuple path.
     """
     vllm_config = get_current_vllm_config()
     hf_config = getattr(vllm_config.model_config, "hf_config", None)
@@ -755,53 +730,7 @@ def _reshape_kv_cache_v2(
                 kv_caches[layer_name] = kv_cache
                 continue
 
-            # Path B: AscendSFAIndexerCacheSpec reshape — (indexer_k_cache,) or
-            # (indexer_k_cache, indexer_scale_cache).
-            if isinstance(kv_cache_spec, AscendSFAIndexerCacheSpec):
-                raw_cache = kv_cache_raw_tensors[layer_name]
-                assert isinstance(raw_cache, tuple)
-                if kv_cache_spec.scale_dim:
-                    raw_k_tensor, raw_scale_tensor = raw_cache
-                    sum_page_size_bytes = (
-                        raw_k_tensor.numel() + raw_scale_tensor.numel()
-                    )
-                else:
-                    (raw_k_tensor,) = raw_cache
-                    raw_scale_tensor = None
-                    sum_page_size_bytes = raw_k_tensor.numel()
-
-                assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
-                num_blocks = sum_page_size_bytes // kv_cache_spec.page_size_bytes
-                if kv_cache_config is not None:
-                    assert num_blocks >= kv_cache_config.num_blocks
-
-                indexer_k_shape = group.backend.get_kv_cache_shape(
-                    num_blocks * kv_cache_spec.sfa_dcp_replicated_indexer_size,
-                    kv_cache_spec.block_size,
-                    kv_cache_spec.num_kv_heads,
-                    kv_cache_spec.head_size,
-                )
-                indexer_k_cache = (
-                    raw_k_tensor.view(kv_cache_spec.dtype).view(indexer_k_shape)
-                )
-                if raw_scale_tensor is None:
-                    kv_caches[layer_name] = (indexer_k_cache,)
-                else:
-                    indexer_scale_shape = group.backend.get_kv_cache_shape(
-                        num_blocks * kv_cache_spec.sfa_dcp_replicated_indexer_size,
-                        kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.scale_dim,
-                    )
-                    indexer_scale_cache = (
-                        raw_scale_tensor
-                        .view(kv_cache_spec.scale_dtype)
-                        .view(indexer_scale_shape)
-                    )
-                    kv_caches[layer_name] = (indexer_k_cache, indexer_scale_cache)
-                continue
-
-            # Path C: cache_only_layers / hidden_state single-tensor reshape
+            # Path B: cache_only_layers / hidden_state single-tensor reshape
             # (extract_hidden_states). No K/V split.
             if (
                 "cache_only_layers" in layer_name
@@ -887,6 +816,64 @@ def _reshape_kv_cache_v2(
 
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
+
+    return kv_caches
+
+
+def init_kv_cache(
+    runner_kv_caches: list[torch.Tensor | list[torch.Tensor]],
+    forward_context: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    device: torch.device,
+    cache_dtype: str,
+    kernel_block_sizes: list[int],
+    vllm_config: VllmConfig,
+) -> dict[str, Any]:
+    """Ascend init_kv_cache for the v2 model runner.
+
+    DeepSeek V4 DSA registers multiple KV-cache sublayers (attn / swa /
+    indexer / state) per decoder layer, which upstream ``bind_kv_cache``
+    rejects on non-CUDA platforms with ``NotImplementedError``. Ported from
+    v1 ``NPUModelRunner.initialize_kv_cache_tensors``: every sublayer's cache
+    is wrapped in a list so ``dsa._build_kv_cache`` can unpack ``kv_cache[0]``,
+    and ``runner_kv_caches`` follow the dsv4 layer-index ordering.
+    """
+    from vllm.v1.worker.gpu.attn_utils import get_shared_kv_cache_layers
+    from vllm.v1.worker.utils import bind_kv_cache
+
+    shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
+    kv_cache_raw_tensors = _allocate_kv_cache(
+        kv_cache_config, shared_kv_cache_layers, device
+    )
+    flattened_attn_groups = list(group for groups in attn_groups for group in groups)
+    kv_caches = _reshape_kv_cache_v2(
+        attn_groups=flattened_attn_groups,
+        kv_cache_raw_tensors=kv_cache_raw_tensors,
+        kernel_block_sizes=kernel_block_sizes,
+        cache_dtype=cache_dtype,
+        shared_kv_cache_layers=shared_kv_cache_layers,
+        kv_cache_config=kv_cache_config,
+    )
+
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type == "deepseek_v4":
+        from vllm_ascend.utils import extract_dsv4_layer_index
+
+        assert len(runner_kv_caches) == 0
+        for layer_name in sorted(
+            kv_caches,
+            key=lambda name: (extract_dsv4_layer_index(hf_config, name), name),
+        ):
+            runner_kv_caches.append(kv_caches[layer_name])
+        for layer_name, kv_cache in kv_caches.items():
+            forward_context[layer_name].kv_cache = [kv_cache]
+    else:
+        num_attn_module = (
+            2 if model_type in ("longcat_flash", "longcat_flash_ngram") else 1
+        )
+        bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
 
     return kv_caches
 
