@@ -42,6 +42,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
@@ -145,6 +147,15 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
+
+    # DSA (DeepSeek V4) builders share three mutable dicts across attention
+    # groups so that cos/sin, decode/prefill split, and per-layer SAS indexer
+    # metadata are computed once by the first DSA group and reused by
+    # subsequent groups (including DSA-CP). Ported from v1
+    # NPUModelRunner._build_attn_group_metadata.
+    prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
+    decode_ratio_to_sas_metadata: dict[Any, Any] = {}
+    common_ratio_to_sas_metadata: dict[Any, Any] = {}
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -178,22 +189,68 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
-            else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
-                    )
-                    if model_specific_attn_metadata is not None
-                    else {}
+
+            # Detect DSA / DSA-CP builders that require special kwargs or
+            # must bypass build_for_cudagraph_capture.
+            is_dsa_builder = isinstance(
+                attn_metadata_builder,
+                (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder),
+            )
+
+            attn_metadata_extra_kwargs = (
+                model_specific_attn_metadata.get_extra_attn_kwargs(
+                    attn_metadata_builder,
+                    num_reqs,
                 )
+                if model_specific_attn_metadata is not None
+                else {}
+            )
+
+            # DSA builders require prefill/decode/common_ratio_to_sas_metadata
+            # dicts plus num_reqs_actual and block_size. For cudagraph capture,
+            # pass empty dicts so the builder recomputes during graph replay.
+            if is_dsa_builder:
+                if for_cudagraph_capture:
+                    prefill_ratio_to_sas_metadata = {}
+                    decode_ratio_to_sas_metadata = {}
+                    common_ratio_to_sas_metadata = {}
+                attn_metadata_extra_kwargs.update(
+                    num_reqs_actual=num_reqs,
+                    prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
+                    decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
+                    common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                    block_size=attn_group.kv_cache_spec.block_size,
+                )
+
+            # DSA / DSA-CP builders must use build() instead of
+            # build_for_cudagraph_capture() during graph capture, because the
+            # base build_for_cudagraph_capture does not forward the extra kwargs
+            # that these builders require.
+            if for_cudagraph_capture and not is_dsa_builder:
+                metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                    common_attn_metadata
+                )
+            else:
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+
+            # Read back the populated dicts from the DSA (non-CP) builder so
+            # subsequent DSA groups can reuse the precomputed cos/sin and
+            # per-layer SAS indexer metadata.
+            if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
+                prefill_ratio_to_sas_metadata = (
+                    attn_metadata_builder.prefill_ratio_to_sas_metadata
+                )
+                decode_ratio_to_sas_metadata = (
+                    attn_metadata_builder.decode_ratio_to_sas_metadata
+                )
+                common_ratio_to_sas_metadata = (
+                    attn_metadata_builder.common_ratio_to_sas_metadata
+                )
+
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
