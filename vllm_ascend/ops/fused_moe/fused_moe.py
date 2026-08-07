@@ -188,6 +188,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        _EXTRA_CTX.input_ids = input_ids
         with self._sequence_parallel_context():
             if self.ascend_shared_experts is None:
                 return self.routed_experts.forward_impl(

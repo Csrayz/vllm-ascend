@@ -412,6 +412,7 @@ class _ExtraForwardContextProxy:
 
     extra_attrs = (
         "capturing",
+        "input_ids",
         "moe_comm_type",
         "moe_comm_method",
         "mmrs_fusion",
