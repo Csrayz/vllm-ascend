@@ -488,8 +488,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             local_seq_lens=self.spec_local_seq_lens[draft_index - 1],
             is_noncausal=is_noncausal,
         )
-        local_query_start_loc = local_query_start_loc.clone()
-        local_seq_lens = local_seq_lens.clone()
+
         local_cos = cos.pad_to(num_tokens_pad)[local_start:local_end_with_pad]
         local_sin = sin.pad_to(num_tokens_pad)[local_start:local_end_with_pad]
 
