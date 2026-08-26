@@ -10,10 +10,12 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
-from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel
+from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer, _compute_num_programs
+from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 
 
 class AscendDSparkProposer(AscendDflashProposer):
@@ -32,11 +34,12 @@ class AscendDSparkProposer(AscendDflashProposer):
     ):
         super().__init__(vllm_config, device, runner=runner)
         assert vllm_config.speculative_config is not None
-        if vllm_config.speculative_config.draft_sample_method == "probabilistic":
-            raise ValueError(
-                "DSpark probabilistic draft sampling is not supported on the v1 "
-                "model runner; use greedy (the default) instead."
-            )
+        self.sample_from_anchor = getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
+        if self.sample_from_anchor:
+            self.num_query_per_req = self.num_speculative_tokens
+        else:
+            self.num_query_per_req = 1 + self.num_speculative_tokens
+
         blk = 1 + self.num_speculative_tokens
         self._dspark_draft_buffer = torch.zeros((self.max_batch_size, blk), dtype=torch.int64, device=device)
         self._dspark_seed_buffer = torch.zeros(self.max_batch_size, dtype=torch.int64, device=device)
@@ -53,12 +56,21 @@ class AscendDSparkProposer(AscendDflashProposer):
             dtype=self.dtype,
             device=self.device,
         )
+        dynamic_spec_config = get_ascend_config().dynamic_spec_config
+        self.dynamic_spec = None
+
+        if dynamic_spec_config.method == "dspark":
+            self.dynamic_spec = DynamicSpecScheduler(
+                method="dspark",
+                method_params=dynamic_spec_config.method_params,
+                max_batch_size=self.max_batch_size,
+                num_speculative_tokens=self.num_speculative_tokens,
+                device=device,
+            )
         # DSpark runs eager only (Ascend cudagraph unsupported on this path).
         self.use_cuda_graph = False
-        # Max query tokens = max_batch_size * num_speculative_tokens
-        # (anchor-first: N query tokens per request, no bonus token, unlike
-        # DFlash's 1+N). Overrides dflash:28; v2 derives via num_query_per_req.
-        self.max_query_tokens = self.max_batch_size * self.num_speculative_tokens
+        # Max query tokens depend on whether sampling from anchor or not.
+        self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Position ids for the draft query block [max_query_tokens].
         # Overrides dflash:49; v2 uses input_buffers.positions.
         self.positions = torch.zeros(
@@ -97,6 +109,25 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         # per-layer context slot mappings as a flat list
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+    def _compute_confidence(
+        self,
+        last_hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        num_tokens = num_reqs * self.num_speculative_tokens
+        flat_hidden = last_hidden_states.reshape(num_tokens, last_hidden_states.shape[-1])
+        # Markov embeddings of the draft input tokens (cheap lookup, so they
+        # are recomputed here instead of being captured in the drafting loop).
+        markov_embs = self.model.markov_embed(draft_token_ids[:, : self.num_speculative_tokens])
+        # The confidence head concatenates both inputs, so their dtypes must
+        # match; it upcasts to float32 internally.
+        flat_markov = markov_embs.reshape(num_tokens, markov_embs.shape[-1]).to(flat_hidden.dtype)
+        conf_raw = self.model.compute_confidence(flat_hidden, flat_markov)
+        confidence = self._dspark_confidence_logits_buffer[:num_reqs]
+        confidence.copy_(conf_raw.reshape(num_reqs, self.num_speculative_tokens))
+        return confidence
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         # Find draft layers (attention layers added by draft model)
@@ -205,8 +236,8 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_seed_buffer[:n].copy_(next_token_ids)
         self._dspark_seed_buffer[n:].fill_(0)
         batch_size = cad.num_reqs
-        block_size = self.num_speculative_tokens
-        num_query_total = batch_size * block_size
+        num_query_total = batch_size * self.num_query_per_req
+        num_sample_total = batch_size * self.num_speculative_tokens
         has_num_rejected = num_rejected_tokens_gpu is not None
         primary_gid = getattr(self, "kv_cache_gid", 0)
         self._per_group_block_table_buffers = {
@@ -217,16 +248,15 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dflash_num_context = int(cad.query_start_loc_cpu[batch_size])
         self._dflash_hidden_states[: self._dflash_num_context] = target_hidden_states[: self._dflash_num_context]
 
-        # below (SAMPLE_FROM_ANCHOR=True, anchor included) -- not arange here.
         token_indices_to_sample = torch.empty(
-            num_query_total,
+            num_sample_total,
             dtype=torch.int32,
             device=self.device,
         )
 
         # Query block: reuse the DFlash inputs kernel logic (host-side ref)
         # per kv-cache-group to fill positions / input_ids / query slot_mapping
-        # / token_indices (SAMPLE_FROM_ANCHOR: anchor at q_idx=0 is sampled too).
+        # / token_indices.
         draft_attn_groups = getattr(self, "draft_attn_groups", [])
         for attn_group in draft_attn_groups:
             gid = attn_group.kv_cache_group_id
@@ -234,7 +264,9 @@ class AscendDSparkProposer(AscendDflashProposer):
             if gid_block_table is None:
                 continue
             kv_block_size = int(attn_group.kv_cache_spec.block_size)
-            copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid[1,](
+            copy_and_expand_dflash_and_dspark_inputs_kernel[
+                (_compute_num_programs(self._dflash_num_context, num_query_total),)
+            ](
                 # Inputs
                 next_token_ids_ptr=next_token_ids,
                 target_positions_ptr=target_positions,
@@ -256,12 +288,12 @@ class AscendDSparkProposer(AscendDflashProposer):
                 # Scalars
                 parallel_drafting_token_id=self.parallel_drafting_token_id,
                 block_size=kv_block_size,
-                num_query_per_req=block_size,
-                num_speculative_tokens=block_size,
+                num_query_per_req=self.num_query_per_req,
+                num_speculative_tokens=self.num_speculative_tokens,
                 total_input_tokens=self._dflash_num_context,
                 batch_size=batch_size,
                 HAS_NUM_REJECTED=has_num_rejected,
-                SAMPLE_FROM_ANCHOR=True,
+                SAMPLE_FROM_ANCHOR=self.sample_from_anchor,
             )
         # to compute self._context_slot_mapping_buffers from dict to list
         self._context_slot_mapping_buffers = [
@@ -272,24 +304,28 @@ class AscendDSparkProposer(AscendDflashProposer):
         if has_num_rejected:
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
 
-        cad.query_start_loc = self.arange_dflash[: batch_size + 1] * block_size
-        cad.seq_lens = effective_seq_lens + block_size
-        cad.query_start_loc_cpu = (torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * block_size).to(
-            torch.int32
-        )
+        cad.query_start_loc = self.arange_dflash[: batch_size + 1] * self.num_query_per_req
+        cad.seq_lens = effective_seq_lens + self.num_query_per_req
+        cad.query_start_loc_cpu = (
+            torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * self.num_query_per_req
+        ).to(torch.int32)
 
         if hasattr(cad, "actual_seq_lengths_q"):
-            cad.actual_seq_lengths_q = [block_size] * batch_size
+            cad.actual_seq_lengths_q = [self.num_query_per_req] * batch_size
         if hasattr(cad, "decode_token_per_req"):
-            cad.decode_token_per_req = block_size
+            cad.decode_token_per_req = self.num_query_per_req
 
         cad.num_actual_tokens = num_query_total
         cad.num_input_tokens = num_query_total
-        cad.max_query_len = block_size
-        cad.max_seq_len = cad.max_seq_len + block_size
+        cad.max_query_len = self.num_query_per_req
+        cad.max_seq_len = cad.max_seq_len + self.num_query_per_req
         cad.slot_mapping = self._per_group_query_slot_mapping_buffers[primary_gid][:num_query_total]
-        cad.positions = self.positions[:num_query_total]
-        cad.causal = False
+        cad.positions = self.positions  # this would be sliced in attention backend
+        if hasattr(self.model, "get_draft_attn_causal"):
+            # Currently, attention causality across draft layers are uniform.
+            cad.causal = self.model.get_draft_attn_causal()[0]
+        else:
+            cad.causal = False
         cad.attn_mask = None
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
@@ -307,11 +343,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         is_profile=False,
         **kwargs,
     ) -> None:
-        # Run dummy_run at full load: the query length of each request is self.num_speculative_tokens
-        # Unlike DFlash, where the query length is self.num_speculative_tokens + 1.
-        # Ensure that the maximum batch token is within the limit of self.max_query_tokens.
-        num_query_per_req = self.num_speculative_tokens
-        num_query_total = num_reqs * num_query_per_req
+        num_query_total = num_reqs * self.num_query_per_req
         num_query_tokens = min(num_query_total if num_reqs > 0 else num_tokens, self.max_query_tokens)
 
         (

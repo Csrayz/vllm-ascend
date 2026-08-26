@@ -19,7 +19,9 @@ dynamic_batch
 epd_disaggregation
 kv_pool
 layerwise_kv_pool
+layerwise_and_sparse_kv_cache_offloading
 kv_cache_cpu_offload
+dyntra_lb
 large_scale_ep
 ucm_deployment
 Fine_grained_TP
@@ -32,4 +34,5 @@ batch_invariance
 lmcache_ascend_deployment
 dynamic_chunk_pipeline_parallel
 flash_attention
+rl
 :::

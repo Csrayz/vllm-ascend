@@ -488,7 +488,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             local_seq_lens=self.spec_local_seq_lens[draft_index - 1],
             is_noncausal=is_noncausal,
         )
-
+        local_query_start_loc = local_query_start_loc.clone()
+        local_seq_lens = local_seq_lens.clone()
         local_cos = cos.pad_to(num_tokens_pad)[local_start:local_end_with_pad]
         local_sin = sin.pad_to(num_tokens_pad)[local_start:local_end_with_pad]
 
@@ -510,7 +511,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         if is_noncausal:
             assert self.speculative_config is not None
             global_dspark_indices, _ = build_dspark_swa_indices(
-                self.block_table[:num_reqs], 
+                self.block_table[:num_reqs],
                 self.speculative_config.num_speculative_tokens,
                 self.model_config.hf_config.sliding_window,
                 self.storage_block_size,
